@@ -13,6 +13,21 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// proposalsTable は schema と再構築マイグレーションの両方で使う。
+// UNIQUE は (date, activity_id, detail): 同日同カテゴリでも種目が違えば
+// 別の募集カードを立てられる(同日同種目の二重カードだけを防ぐ)。
+const proposalsTable = `
+CREATE TABLE IF NOT EXISTS proposals (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	date        TEXT NOT NULL,
+	activity_id TEXT NOT NULL,
+	detail      TEXT NOT NULL DEFAULT '',
+	channel_id  TEXT NOT NULL DEFAULT '',
+	message_id  TEXT NOT NULL DEFAULT '',
+	thread_id   TEXT NOT NULL DEFAULT '',
+	UNIQUE (date, activity_id, detail)
+);`
+
 const schema = `
 CREATE TABLE IF NOT EXISTS settings (
 	key   TEXT PRIMARY KEY,
@@ -36,15 +51,7 @@ CREATE TABLE IF NOT EXISTS pw_progress (
 	progress   TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS proposals (
-	id          INTEGER PRIMARY KEY AUTOINCREMENT,
-	date        TEXT NOT NULL,
-	activity_id TEXT NOT NULL,
-	channel_id  TEXT NOT NULL DEFAULT '',
-	message_id  TEXT NOT NULL DEFAULT '',
-	thread_id   TEXT NOT NULL DEFAULT '',
-	UNIQUE (date, activity_id)
-);
+` + proposalsTable + `
 CREATE TABLE IF NOT EXISTS responses (
 	proposal_id INTEGER NOT NULL,
 	user_id     TEXT NOT NULL,
@@ -77,7 +84,50 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("スキーマ適用失敗: %w", err)
 	}
+	// 素朴なマイグレーション: detail 列が無い既存 DB に追加する
+	// (新規 DB は schema で作成済みのため duplicate column になり、無視してよい)
+	if _, err := db.Exec(`ALTER TABLE proposals ADD COLUMN detail TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
+		db.Close()
+		return nil, fmt.Errorf("マイグレーション失敗(proposals.detail): %w", err)
+	}
+	if err := migrateProposalsUnique(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("マイグレーション失敗(proposals UNIQUE): %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// migrateProposalsUnique は旧 UNIQUE(date, activity_id) のテーブルを
+// UNIQUE(date, activity_id, detail) に作り直す(SQLite は制約変更不可のため再構築)。
+// sqlite_master の SQL はこのパッケージが書いた schema 文字列そのものなので、
+// 現行の UNIQUE 句を含むかどうかで新旧を判定できる。
+func migrateProposalsUnique(db *sql.DB) error {
+	var tblSQL string
+	if err := db.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'proposals'`).Scan(&tblSQL); err != nil {
+		return err
+	}
+	if strings.Contains(tblSQL, "UNIQUE (date, activity_id, detail)") {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`ALTER TABLE proposals RENAME TO proposals_old`,
+		proposalsTable,
+		`INSERT INTO proposals (id, date, activity_id, detail, channel_id, message_id, thread_id)
+		 SELECT id, date, activity_id, detail, channel_id, message_id, thread_id FROM proposals_old`,
+		`DROP TABLE proposals_old`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -259,17 +309,19 @@ type Proposal struct {
 	ID         int64
 	Date       string
 	ActivityID string
+	Detail     string // 種目(activity.Variant の ID)。未指定は ""
 	ChannelID  string
 	MessageID  string
 	ThreadID   string
 }
 
-// CreateProposal は提案を作成して返す。同日同活動が既にあれば
+// CreateProposal は提案を作成して返す。同日同活動同種目が既にあれば
 // 既存の提案を created=false で返す(呼び出し側の引き直し不要)。
-func (s *Store) CreateProposal(date, activityID string) (Proposal, bool, error) {
+// 同日同活動でも種目(detail)が違えば別の提案として作成できる。
+func (s *Store) CreateProposal(date, activityID, detail string) (Proposal, bool, error) {
 	res, err := s.db.Exec(
-		`INSERT OR IGNORE INTO proposals (date, activity_id) VALUES (?, ?)`,
-		date, activityID)
+		`INSERT OR IGNORE INTO proposals (date, activity_id, detail) VALUES (?, ?, ?)`,
+		date, activityID, detail)
 	if err != nil {
 		return Proposal{}, false, err
 	}
@@ -279,9 +331,46 @@ func (s *Store) CreateProposal(date, activityID string) (Proposal, bool, error) 
 	}
 	p := Proposal{Date: date, ActivityID: activityID}
 	err = s.db.QueryRow(
-		`SELECT id, channel_id, message_id, thread_id FROM proposals WHERE date = ? AND activity_id = ?`,
-		date, activityID).Scan(&p.ID, &p.ChannelID, &p.MessageID, &p.ThreadID)
+		`SELECT id, detail, channel_id, message_id, thread_id FROM proposals
+		 WHERE date = ? AND activity_id = ? AND detail = ?`,
+		date, activityID, detail).Scan(&p.ID, &p.Detail, &p.ChannelID, &p.MessageID, &p.ThreadID)
 	return p, n > 0, err
+}
+
+// FindProposal は同日同活動同種目の提案を探す(無ければ ok=false)。
+// 種目なしカテゴリの「すでに募集中か」の判定に使う。
+func (s *Store) FindProposal(date, activityID, detail string) (Proposal, bool, error) {
+	p := Proposal{Date: date, ActivityID: activityID}
+	err := s.db.QueryRow(
+		`SELECT id, detail, channel_id, message_id, thread_id FROM proposals
+		 WHERE date = ? AND activity_id = ? AND detail = ?`,
+		date, activityID, detail).Scan(&p.ID, &p.Detail, &p.ChannelID, &p.MessageID, &p.ThreadID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Proposal{}, false, nil
+	}
+	return p, err == nil, err
+}
+
+// FindProposalsByActivity は同日同活動の提案を種目問わずすべて返す。
+// 種目セレクトに「募集中」の印を付けるために使う。
+func (s *Store) FindProposalsByActivity(date, activityID string) ([]Proposal, error) {
+	rows, err := s.db.Query(
+		`SELECT id, detail, channel_id, message_id, thread_id FROM proposals
+		 WHERE date = ? AND activity_id = ?`,
+		date, activityID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Proposal
+	for rows.Next() {
+		p := Proposal{Date: date, ActivityID: activityID}
+		if err := rows.Scan(&p.ID, &p.Detail, &p.ChannelID, &p.MessageID, &p.ThreadID); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // DeleteProposal はカード投稿に失敗した提案の巻き戻しに使う。回答も併せて消す。
@@ -308,10 +397,11 @@ func (s *Store) SetProposalThread(id int64, threadID string) error {
 func (s *Store) GetProposal(id int64) (Proposal, error) {
 	p := Proposal{ID: id}
 	err := s.db.QueryRow(
-		`SELECT date, activity_id, channel_id, message_id, thread_id FROM proposals WHERE id = ?`,
-		id).Scan(&p.Date, &p.ActivityID, &p.ChannelID, &p.MessageID, &p.ThreadID)
+		`SELECT date, activity_id, detail, channel_id, message_id, thread_id FROM proposals WHERE id = ?`,
+		id).Scan(&p.Date, &p.ActivityID, &p.Detail, &p.ChannelID, &p.MessageID, &p.ThreadID)
 	return p, err
 }
+
 // ---- responses ----
 
 // SetResponse は以前の回答を返しつつ上書きする(未回答なら "")。

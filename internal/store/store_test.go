@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 )
@@ -154,36 +155,150 @@ func TestPWProgress(t *testing.T) {
 func TestCreateProposalIdempotent(t *testing.T) {
 	st := newTestStore(t)
 
-	p1, created, err := st.CreateProposal("2026-06-11", "levelre")
+	p1, created, err := st.CreateProposal("2026-06-11", "roulette", "levelre")
 	if err != nil || !created || p1.ID == 0 {
 		t.Fatalf("1回目 CreateProposal: %+v created=%v err=%v", p1, created, err)
 	}
+	if p1.Detail != "levelre" {
+		t.Fatalf("Detail = %q; want levelre", p1.Detail)
+	}
 
-	// 同日同活動は二重作成せず、既存の提案を created=false で返す
+	// 同日同活動同種目は二重作成せず、既存の提案を created=false で返す
 	st.SetProposalMessage(p1.ID, "chanX", "msgX")
-	p2, created2, err := st.CreateProposal("2026-06-11", "levelre")
+	p2, created2, err := st.CreateProposal("2026-06-11", "roulette", "levelre")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if created2 {
 		t.Fatalf("二重作成された: %+v", p2)
 	}
-	if p2.ID != p1.ID || p2.ChannelID != "chanX" || p2.MessageID != "msgX" {
+	if p2.ID != p1.ID || p2.ChannelID != "chanX" || p2.MessageID != "msgX" || p2.Detail != "levelre" {
 		t.Fatalf("既存提案が返らない: %+v", p2)
 	}
 
+	// 同日同活動でも種目が違えば作成できる(2 つ目の募集が立てられる)
+	p3, created3, err := st.CreateProposal("2026-06-11", "roulette", "expert")
+	if err != nil || !created3 || p3.ID == p1.ID || p3.Detail != "expert" {
+		t.Fatalf("別種目が作成できない: %+v created=%v err=%v", p3, created3, err)
+	}
+
 	// 別活動・別日は作成できる
-	if _, created, _ := st.CreateProposal("2026-06-11", "map"); !created {
+	if _, created, _ := st.CreateProposal("2026-06-11", "map", ""); !created {
 		t.Fatal("別活動が作成できない")
 	}
-	if _, created, _ := st.CreateProposal("2026-06-12", "levelre"); !created {
+	if _, created, _ := st.CreateProposal("2026-06-12", "roulette", ""); !created {
 		t.Fatal("別日が作成できない")
+	}
+}
+
+// 旧スキーマ(detail 列なし・UNIQUE(date, activity_id))の DB を Open すると
+// detail 列の追加と UNIQUE(date, activity_id, detail) への再構築が行われること。
+func TestOpenMigratesProposals(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE proposals (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		date        TEXT NOT NULL,
+		activity_id TEXT NOT NULL,
+		channel_id  TEXT NOT NULL DEFAULT '',
+		message_id  TEXT NOT NULL DEFAULT '',
+		thread_id   TEXT NOT NULL DEFAULT '',
+		UNIQUE (date, activity_id)
+	); INSERT INTO proposals (date, activity_id, message_id) VALUES ('2026-06-10', 'pw', 'msg1');`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("旧スキーマの Open に失敗: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	// 既存行は detail = '' のまま保持される(ID・メッセージも維持)
+	old, found, err := st.FindProposal("2026-06-10", "pw", "")
+	if err != nil || !found || old.Detail != "" || old.MessageID != "msg1" {
+		t.Fatalf("旧行の読み出し: %+v found=%v err=%v", old, found, err)
+	}
+
+	// 再構築後は同日同活動でも種目が違えば作成できる(旧 UNIQUE では不可)
+	p1, created, err := st.CreateProposal("2026-06-11", "roulette", "levelre")
+	if err != nil || !created {
+		t.Fatalf("マイグレーション後の作成: %+v created=%v err=%v", p1, created, err)
+	}
+	p2, created, err := st.CreateProposal("2026-06-11", "roulette", "expert")
+	if err != nil || !created || p2.ID == p1.ID {
+		t.Fatalf("別種目の作成: %+v created=%v err=%v", p2, created, err)
+	}
+
+	// 再 Open しても再構築は走らず冪等(行も消えない)
+	st.Close()
+	st2, err := Open(path)
+	if err != nil {
+		t.Fatalf("2 回目の Open に失敗: %v", err)
+	}
+	t.Cleanup(func() { st2.Close() })
+	if _, found, _ := st2.FindProposal("2026-06-10", "pw", ""); !found {
+		t.Fatal("再 Open 後に旧行が消えた")
+	}
+	if got, _ := st2.FindProposalsByActivity("2026-06-11", "roulette"); len(got) != 2 {
+		t.Fatalf("再 Open 後の行数 = %d; want 2", len(got))
+	}
+}
+
+func TestFindProposal(t *testing.T) {
+	st := newTestStore(t)
+
+	if _, found, err := st.FindProposal("2026-06-11", "map", "g17"); err != nil || found {
+		t.Fatalf("未作成なのに found=%v err=%v", found, err)
+	}
+
+	p, _, _ := st.CreateProposal("2026-06-11", "map", "g17")
+	st.SetProposalMessage(p.ID, "chan1", "msg1")
+
+	got, found, err := st.FindProposal("2026-06-11", "map", "g17")
+	if err != nil || !found {
+		t.Fatalf("FindProposal: found=%v err=%v", found, err)
+	}
+	if got.ID != p.ID || got.Detail != "g17" || got.MessageID != "msg1" {
+		t.Fatalf("FindProposal = %+v", got)
+	}
+	// 種目違いはヒットしない
+	if _, found, _ := st.FindProposal("2026-06-11", "map", ""); found {
+		t.Fatal("種目違いの提案がヒットした")
+	}
+}
+
+func TestFindProposalsByActivity(t *testing.T) {
+	st := newTestStore(t)
+	p1, _, _ := st.CreateProposal("2026-06-11", "roulette", "levelre")
+	st.SetProposalMessage(p1.ID, "chan1", "msg1")
+	st.CreateProposal("2026-06-11", "roulette", "expert")
+	st.CreateProposal("2026-06-11", "map", "g17")   // 別活動
+	st.CreateProposal("2026-06-12", "roulette", "") // 別日
+
+	got, err := st.FindProposalsByActivity("2026-06-11", "roulette")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d; want 2 (%+v)", len(got), got)
+	}
+	details := map[string]string{}
+	for _, p := range got {
+		details[p.Detail] = p.MessageID
+	}
+	if details["levelre"] != "msg1" || details["expert"] != "" {
+		t.Fatalf("details = %v", details)
 	}
 }
 
 func TestProposalMessageAndThread(t *testing.T) {
 	st := newTestStore(t)
-	p, _, _ := st.CreateProposal("2026-06-11", "pw")
+	p, _, _ := st.CreateProposal("2026-06-11", "weapon", "")
 	id := p.ID
 
 	if err := st.SetProposalMessage(id, "chan1", "msg1"); err != nil {
@@ -197,7 +312,7 @@ func TestProposalMessageAndThread(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prop.Date != "2026-06-11" || prop.ActivityID != "pw" ||
+	if prop.Date != "2026-06-11" || prop.ActivityID != "weapon" ||
 		prop.ChannelID != "chan1" || prop.MessageID != "msg1" || prop.ThreadID != "thread1" {
 		t.Fatalf("GetProposal = %+v", prop)
 	}
@@ -205,7 +320,7 @@ func TestProposalMessageAndThread(t *testing.T) {
 
 func TestDeleteProposal(t *testing.T) {
 	st := newTestStore(t)
-	p, _, _ := st.CreateProposal("2026-06-11", "levelre")
+	p, _, _ := st.CreateProposal("2026-06-11", "roulette", "")
 	st.SetResponse(p.ID, "u1", "join")
 
 	if err := st.DeleteProposal(p.ID); err != nil {
@@ -219,14 +334,14 @@ func TestDeleteProposal(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("回答が残っている: %v", got)
 	}
-	if _, created, _ := st.CreateProposal("2026-06-11", "levelre"); !created {
+	if _, created, _ := st.CreateProposal("2026-06-11", "roulette", ""); !created {
 		t.Fatal("削除後に再作成できない")
 	}
 }
 
 func TestResponsesPrevAndOrder(t *testing.T) {
 	st := newTestStore(t)
-	p, _, _ := st.CreateProposal("2026-06-11", "mobhunt")
+	p, _, _ := st.CreateProposal("2026-06-11", "mobhunt", "")
 	id := p.ID
 
 	// 初回は prev が空
@@ -265,7 +380,7 @@ func TestResponsesPrevAndOrder(t *testing.T) {
 
 func TestResponsesInsertionOrder(t *testing.T) {
 	st := newTestStore(t)
-	p, _, _ := st.CreateProposal("2026-06-11", "levelre")
+	p, _, _ := st.CreateProposal("2026-06-11", "roulette", "")
 	id := p.ID
 	// 押した順(rowid 順)が維持されること
 	for _, u := range []string{"a", "b", "c", "d"} {

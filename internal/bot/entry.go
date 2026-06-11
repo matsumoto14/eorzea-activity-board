@@ -15,19 +15,38 @@ import (
 // メッセージ ID を返す。
 func (b *Bot) PostEntryMessage(channelID string) (string, error) {
 	embed := &discordgo.MessageEmbed{
-		Title: "🏰 エオルゼア活動ボード",
+		Title: "🎩 エオルゼア活動ボード",
 		Description: strings.Join([]string{
-			"日々の活動をゆるくマッチングするボードです。",
+			"ごきげんよう、諸君! 私、ヒルディブランド……",
+			"人呼んで、**美麗なる紳士** であります!",
 			"",
-			"**📝 やりたいこと設定** … 普段やりたい活動・時間帯・スタンスを登録",
-			"**📅 今日の状態** … 「今日いける/呼ばれたら/無理」を切り替え",
-			"**⚔️ PW進捗を更新** … 自分の PW 作成の進捗メモを更新",
-			"**📋 PW進捗一覧** … みんなの進捗を見る",
+			"このボードは、日々の活動をゆるくマッチングする社交場。",
+			"諸君はボタンを押すだけでよいのです。",
 			"",
-			"毎日 20 時ごろ、成立しそうな活動の候補を投稿します。",
-			"候補にはボタンで反応するだけで OK。人数が集まったら自動でスレッドが立ちます。",
+			"───────────────",
+			"",
+			"**📝 やりたいこと設定**",
+			"普段やりたい活動・時間帯・スタンスを登録",
+			"",
+			"**📅 今日の状態**",
+			"「今日いける/呼ばれたら/無理」を切り替え",
+			"",
+			"**⚔️ 武器進捗を更新**",
+			"PW・RW など武器作成の進捗メモを更新",
+			"",
+			"**📋 武器進捗一覧**",
+			"諸君の進捗を一望",
+			"",
+			"**✍️ フリー募集**",
+			"好きな内容を入力して、その場で今日の募集を立てる",
+			"",
+			"───────────────",
+			"",
+			"毎晩 20 時ごろ、私が本日の活動候補をお届けします。",
+			"人数が揃えば、スレッドも自動で立つ……",
+			"さすれば事件(マッチング)は、自ずと解決するのであります!",
 		}, "\n"),
-		Color: 0x5865F2,
+		Color: 0xD4AF37,
 	}
 	msg, err := b.session.ChannelMessageSendComplex(channelID, &discordgo.MessageSend{
 		Embeds: []*discordgo.MessageEmbed{embed},
@@ -35,8 +54,9 @@ func (b *Bot) PostEntryMessage(channelID string) (string, error) {
 			discordgo.ActionsRow{Components: []discordgo.MessageComponent{
 				discordgo.Button{Label: "📝 やりたいこと設定", Style: discordgo.PrimaryButton, CustomID: "entry:prefs"},
 				discordgo.Button{Label: "📅 今日の状態", Style: discordgo.SecondaryButton, CustomID: "entry:today"},
-				discordgo.Button{Label: "⚔️ PW進捗を更新", Style: discordgo.SecondaryButton, CustomID: "entry:pw"},
-				discordgo.Button{Label: "📋 PW進捗一覧", Style: discordgo.SecondaryButton, CustomID: "entry:pwlist"},
+				discordgo.Button{Label: "⚔️ 武器進捗を更新", Style: discordgo.SecondaryButton, CustomID: "entry:pw"},
+				discordgo.Button{Label: "📋 武器進捗一覧", Style: discordgo.SecondaryButton, CustomID: "entry:pwlist"},
+				discordgo.Button{Label: "✍️ フリー募集", Style: discordgo.SecondaryButton, CustomID: "free:open"},
 			}},
 		},
 	})
@@ -57,12 +77,14 @@ func (b *Bot) handleEntryPrefs(s *discordgo.Session, i *discordgo.InteractionCre
 		return err
 	}
 
+	// 保存済みの旧アクティビティ ID は現行 ID に解決してから Default に反映する
+	savedActs := activity.NormalizeIDs(prefs.Activities)
 	actOpts := make([]discordgo.SelectMenuOption, 0, len(activity.All))
 	for _, a := range activity.All {
 		actOpts = append(actOpts, discordgo.SelectMenuOption{
 			Label:   a.Emoji + " " + a.Name,
 			Value:   a.ID,
-			Default: slices.Contains(prefs.Activities, a.ID),
+			Default: slices.Contains(savedActs, a.ID),
 		})
 	}
 	slotOpts := make([]discordgo.SelectMenuOption, 0, len(activity.TimeSlots))
@@ -114,7 +136,7 @@ func (b *Bot) handleEntryPrefs(s *discordgo.Session, i *discordgo.InteractionCre
 		}},
 	}
 	return respondEphemeral(s, i,
-		"📝 **やりたいこと設定**(選んだ瞬間に保存されます)", components, nil)
+		"📝 **やりたいこと設定** ─ お好みをお聞かせください(選んだ瞬間に保存されます)", components, nil)
 }
 
 // handlePrefsSelect はセレクトメニューの選択を即保存する。
@@ -139,9 +161,7 @@ func (b *Bot) handlePrefsSelect(s *discordgo.Session, i *discordgo.InteractionCr
 		return err
 	}
 	// 表示はそのまま、応答だけ返す
-	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredMessageUpdate,
-	})
+	return ackUpdate(s, i)
 }
 
 var todayStatuses = []struct {
@@ -176,7 +196,7 @@ func todayButtons() []discordgo.MessageComponent {
 // handleEntryToday は今日の状態変更ボタンをエフェメラルで返す。
 func (b *Bot) handleEntryToday(s *discordgo.Session, i *discordgo.InteractionCreate) error {
 	return respondEphemeral(s, i,
-		fmt.Sprintf("📅 **今日(%s)の状態**を選んでください", b.todayLabel()),
+		fmt.Sprintf("📅 **本日(%s)のご予定** はいかがかな?", b.todayLabel()),
 		todayButtons(), nil)
 }
 
@@ -189,7 +209,7 @@ func (b *Bot) handleTodayButton(s *discordgo.Session, i *discordgo.InteractionCr
 	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseUpdateMessage,
 		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("📅 今日(%s)の状態を **%s** にしました(いつでも変更できます)",
+			Content: fmt.Sprintf("📅 本日(%s)の状態、**%s** にて承りました!(いつでも変更できます)",
 				b.todayLabel(), todayStatusLabel(status)),
 			Components: todayButtons(),
 		},
@@ -207,14 +227,14 @@ func (b *Bot) handleEntryPW(s *discordgo.Session, i *discordgo.InteractionCreate
 		Type: discordgo.InteractionResponseModal,
 		Data: &discordgo.InteractionResponseData{
 			CustomID: "pw:modal",
-			Title:    "PW作成の進捗",
+			Title:    "武器作成の進捗",
 			Components: []discordgo.MessageComponent{
 				discordgo.ActionsRow{Components: []discordgo.MessageComponent{
 					discordgo.TextInput{
 						CustomID:    "pw:progress",
 						Label:       "いまの進捗",
 						Style:       discordgo.TextInputShort,
-						Placeholder: "例: 2本目 / 素材集め中 / 強化素材あと3個",
+						Placeholder: "例: PW 2本目 / RW 素材集め中 / ZW あと3個",
 						Value:       current,
 						Required:    true,
 						MaxLength:   100,
@@ -228,24 +248,12 @@ func (b *Bot) handleEntryPW(s *discordgo.Session, i *discordgo.InteractionCreate
 // handlePWModalSubmit はモーダルの入力を保存する。
 func (b *Bot) handlePWModalSubmit(s *discordgo.Session, i *discordgo.InteractionCreate) error {
 	uid := interactionUser(i).ID
-	data := i.ModalSubmitData()
-	progress := ""
-	for _, row := range data.Components {
-		ar, ok := row.(*discordgo.ActionsRow)
-		if !ok {
-			continue
-		}
-		for _, c := range ar.Components {
-			if ti, ok := c.(*discordgo.TextInput); ok && ti.CustomID == "pw:progress" {
-				progress = ti.Value
-			}
-		}
-	}
+	progress := modalTextInput(i.ModalSubmitData(), "pw:progress")
 	if err := b.store.SetPWProgress(uid, progress); err != nil {
 		return err
 	}
 	return respondEphemeral(s, i,
-		fmt.Sprintf("⚔️ PW進捗を更新しました: **%s**", progress), nil, nil)
+		fmt.Sprintf("⚔️ 武器進捗、確かに記録いたしました: **%s**", progress), nil, nil)
 }
 
 // handleEntryPWList は全員の PW 進捗一覧をエフェメラルで返す。
@@ -256,7 +264,7 @@ func (b *Bot) handleEntryPWList(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 	if len(list) == 0 {
 		return respondEphemeral(s, i,
-			"📋 まだ誰も PW 進捗を登録していません。「⚔️ PW進捗を更新」から登録できます。", nil, nil)
+			"📋 ふむ、まだ誰も武器進捗を登録していないようであります。「⚔️ 武器進捗を更新」からどうぞ。", nil, nil)
 	}
 	var sb strings.Builder
 	for _, p := range list {
@@ -264,12 +272,14 @@ func (b *Bot) handleEntryPWList(s *discordgo.Session, i *discordgo.InteractionCr
 		if t, err := time.Parse(time.RFC3339, p.UpdatedAt); err == nil {
 			date = fmt.Sprintf("(%s 更新)", monthDay(t.In(b.loc)))
 		}
-		fmt.Fprintf(&sb, "<@%s> … %s %s\n", p.UserID, p.Progress, date)
+		// 1 人 2 行 + 空行で、詰まらない一覧にする
+		fmt.Fprintf(&sb, "<@%s>\n　└ %s %s\n\n", p.UserID, p.Progress, date)
 	}
 	embed := &discordgo.MessageEmbed{
-		Title:       "📋 PW作成 進捗一覧",
+		Title:       "📋 武器作成 進捗一覧",
 		Description: limitEmbed(sb.String(), 4096), // description の上限は 4096 文字
 		Color:       0xE67E22,
+		Footer:      &discordgo.MessageEmbedFooter{Text: "諸君の研鑽、見事であります"},
 	}
 	return respondEphemeral(s, i, "", nil, []*discordgo.MessageEmbed{embed})
 }

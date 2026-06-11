@@ -16,11 +16,15 @@ func uids(prefs []store.Prefs) []string {
 
 func TestCandidatesFor(t *testing.T) {
 	prefsAll := []store.Prefs{
-		{UserID: "u1", Activities: []string{"levelre", "pw"}},
-		{UserID: "u2", Activities: []string{"levelre"}},
+		{UserID: "u1", Activities: []string{"roulette", "weapon"}},
+		{UserID: "u2", Activities: []string{"roulette"}},
 		{UserID: "u3", Activities: []string{"map"}},
-		{UserID: "u4", Activities: []string{"levelre"}},
+		{UserID: "u4", Activities: []string{"roulette"}},
+		// u5 は旧 ID のまま保存されている(levelre→roulette / pw→weapon に吸収される)
+		{UserID: "u5", Activities: []string{"levelre", "pw"}},
 	}
+	// candidatesFor は normalizePrefs 済みの prefs を前提とする(旧 ID の吸収はここ)
+	prefsAll = normalizePrefs(prefsAll)
 
 	tests := []struct {
 		name     string
@@ -29,21 +33,21 @@ func TestCandidatesFor(t *testing.T) {
 		want     []string
 	}{
 		{
-			name:     "やりたい登録がある人だけ",
-			actID:    "levelre",
+			name:     "やりたい登録がある人だけ(旧 ID も吸収)",
+			actID:    "roulette",
 			statuses: map[string]string{},
-			want:     []string{"u1", "u2", "u4"},
+			want:     []string{"u1", "u2", "u4", "u5"},
 		},
 		{
 			name:     "今日は無理(no)の人は除外",
-			actID:    "levelre",
-			statuses: map[string]string{"u2": "no"},
+			actID:    "roulette",
+			statuses: map[string]string{"u2": "no", "u5": "no"},
 			want:     []string{"u1", "u4"},
 		},
 		{
 			name:     "ok / maybe は候補に残る",
-			actID:    "levelre",
-			statuses: map[string]string{"u1": "ok", "u2": "maybe", "u4": "no"},
+			actID:    "roulette",
+			statuses: map[string]string{"u1": "ok", "u2": "maybe", "u4": "no", "u5": "no"},
 			want:     []string{"u1", "u2"},
 		},
 		{
@@ -57,6 +61,12 @@ func TestCandidatesFor(t *testing.T) {
 			actID:    "map",
 			statuses: map[string]string{},
 			want:     []string{"u3"},
+		},
+		{
+			name:     "旧 pw 登録は weapon の候補になる",
+			actID:    "weapon",
+			statuses: map[string]string{},
+			want:     []string{"u1", "u5"},
 		},
 	}
 

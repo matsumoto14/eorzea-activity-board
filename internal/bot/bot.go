@@ -102,25 +102,32 @@ func (b *Bot) onInteraction(s *discordgo.Session, i *discordgo.InteractionCreate
 			err = b.handleEntryPW(s, i)
 		case id == "entry:pwlist":
 			err = b.handleEntryPWList(s, i)
+		case id == "free:open":
+			err = b.handleFreeOpen(s, i)
 		case id == "prefs:activities", id == "prefs:timeslots", id == "prefs:stance":
 			err = b.handlePrefsSelect(s, i, id)
 		case strings.HasPrefix(id, "summary:open"):
 			err = b.handleSummaryOpen(s, i, id)
+		case strings.HasPrefix(id, "summary:variant:"):
+			err = b.handleSummaryVariant(s, i, id)
 		case strings.HasPrefix(id, "today:"):
 			err = b.handleTodayButton(s, i, strings.TrimPrefix(id, "today:"))
 		case strings.HasPrefix(id, "prop:"):
 			err = b.handleProposalButton(s, i, id)
 		}
 	case discordgo.InteractionModalSubmit:
-		if i.ModalSubmitData().CustomID == "pw:modal" {
+		switch i.ModalSubmitData().CustomID {
+		case "pw:modal":
 			err = b.handlePWModalSubmit(s, i)
+		case "free:modal":
+			err = b.handleFreeModalSubmit(s, i)
 		}
 	}
 	if err != nil {
 		slog.Error("interaction 処理失敗", "err", err)
 		// 失敗をユーザーにも伝える。deferred ack 済みのハンドラでは
 		// InteractionRespond が通らないため、フォローアップで送る。
-		const failMsg = "⚠️ 処理に失敗しました。もう一度試してみてください。"
+		const failMsg = "⚠️ なんたる失態……! 処理に失敗いたしました。今一度お試しください。"
 		respondErr := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
@@ -145,6 +152,39 @@ func limitEmbed(s string, limit int) string {
 		return s
 	}
 	return string(r[:limit-1]) + "…"
+}
+
+// ackEphemeral はエフェメラル応答を予約する deferred ack(3 秒期限対策)。
+// 結果は InteractionResponseEdit で同じエフェメラルに反映する。
+func ackEphemeral(s *discordgo.Session, i *discordgo.InteractionCreate) error {
+	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{Flags: discordgo.MessageFlagsEphemeral},
+	})
+}
+
+// ackUpdate は元メッセージの表示を変えずに interaction だけ ack する deferred ack。
+// 結果を反映する場合は後から InteractionResponseEdit を使う。
+func ackUpdate(s *discordgo.Session, i *discordgo.InteractionCreate) error {
+	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredMessageUpdate,
+	})
+}
+
+// modalTextInput はモーダル送信データから customID が一致する TextInput の値を取り出す。
+func modalTextInput(data discordgo.ModalSubmitInteractionData, customID string) string {
+	for _, row := range data.Components {
+		ar, ok := row.(*discordgo.ActionsRow)
+		if !ok {
+			continue
+		}
+		for _, c := range ar.Components {
+			if ti, ok := c.(*discordgo.TextInput); ok && ti.CustomID == customID {
+				return ti.Value
+			}
+		}
+	}
+	return ""
 }
 
 // respondEphemeral はエフェメラル(本人にだけ見える)メッセージで応答する。

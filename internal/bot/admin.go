@@ -29,10 +29,10 @@ func (b *Bot) onMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) 
 		err = b.cmdSetup(s, m)
 	case "post":
 		var posted bool
-		if posted, err = b.postDailyProposals(); err == nil {
-			msg := "📤 今日の候補を投稿しました。"
+		if posted, err = b.postDailyProposals(true); err == nil {
+			msg := "📤 本日の候補、投稿完了であります。"
 			if !posted {
-				msg = "ℹ️ 今日のサマリーは投稿済みのためスキップしました(チャンネル未設定の場合は `!eab setup`)。"
+				msg = "⚠️ 掲示板チャンネルが未設定であります。`!eab setup` を実行してください。"
 			}
 			_, err = s.ChannelMessageSend(m.ChannelID, msg)
 		}
@@ -76,6 +76,6 @@ func (b *Bot) cmdSetup(s *discordgo.Session, m *discordgo.MessageCreate) error {
 		return err
 	}
 	_, err = s.ChannelMessageSend(m.ChannelID,
-		"✅ このチャンネルを掲示板に設定しました。毎日 20 時ごろに候補を投稿します。")
+		"✅ このチャンネルを掲示板に設定いたしました。毎晩 20 時ごろ、私が候補をお届けします。")
 	return err
 }
