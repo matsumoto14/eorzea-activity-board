@@ -1,0 +1,14 @@
+# ビルド成果物
+/bin/
+/bot
+*.exe
+
+# ローカルデータ
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# 秘密情報
+.env
+.env.*
